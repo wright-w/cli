@@ -1,12 +1,55 @@
 package run
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	flag "github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPipelineOptionsPathSelectionsPayload(t *testing.T) {
+	opts := PipelineOptions{
+		Refresh:           []string{"catalog.schema.table1"},
+		FullRefresh:       []string{"catalog.schema.table2"},
+		RefreshByPath:     []string{"/Workspace/Shared/source.sql"},
+		FullRefreshByPath: []string{"/Workspace/Shared/notebook"},
+	}
+	payload, err := opts.toPayload(nil, "pipeline-id", false)
+	require.NoError(t, err)
+	assert.Equal(t, "pipeline-id", payload.PipelineId)
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"refresh_selection": ["catalog.schema.table1"],
+		"full_refresh_selection": ["catalog.schema.table2"],
+		"refresh_selection_by_path": ["/Workspace/Shared/source.sql"],
+		"full_refresh_selection_by_path": ["/Workspace/Shared/notebook"]
+	}`, string(data))
+}
+
+func TestPipelineOptionsValidatePathSelections(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		for _, exclusive := range []string{"refresh-all", "full-refresh-all", "validate-only"} {
+			t.Run(fmt.Sprintf("full=%t/%s", full, exclusive), func(t *testing.T) {
+				opts := PipelineOptions{
+					RefreshAll:     exclusive == "refresh-all",
+					FullRefreshAll: exclusive == "full-refresh-all",
+					ValidateOnly:   exclusive == "validate-only",
+				}
+				if full {
+					opts.FullRefreshByPath = []string{"/Workspace/Shared/source.sql"}
+				} else {
+					opts.RefreshByPath = []string{"/Workspace/Shared/source.sql"}
+				}
+				_, err := opts.toPayload(nil, "pipeline-id", false)
+				assert.ErrorContains(t, err, "cannot use --refresh or --full-refresh together with --"+exclusive)
+			})
+		}
+	}
+}
 
 func setupPipelineOptions(t *testing.T) (*flag.FlagSet, *PipelineOptions) {
 	var fs flag.FlagSet

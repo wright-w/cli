@@ -1,6 +1,10 @@
 bundle:
   name: test-pipeline-run-flags
 
+sync:
+  exclude:
+    - excluded.sql
+
 resources:
   pipelines:
     my_pipeline:
@@ -8,3 +12,5 @@ resources:
       libraries:
         - file:
             path: pipeline_file.py
+        - notebook:
+            path: notebook.py

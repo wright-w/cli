@@ -233,7 +233,13 @@ func runCommand() *cobra.Command {
 		Long: `Run the pipeline identified by KEY.
 KEY is the unique name of the pipeline to run, as defined in its YAML file.
 If there is only one pipeline in the project, KEY is optional and the pipeline will be auto-selected.
-Refreshes all tables in the pipeline unless otherwise specified.`,
+Refreshes all tables in the pipeline unless otherwise specified.
+
+Use --refresh or --full-refresh with table names, local source files, or absolute
+/Workspace/ paths. Local files use the bundle sync configuration and paths are
+relative to the current directory. Deploy local changes before running.
+Existing local files take precedence over unquoted table names. Use ./ to require
+a file, or quote table identifiers with backticks to select an ambiguous table.`,
 	}
 
 	var refresh []string
@@ -241,9 +247,9 @@ Refreshes all tables in the pipeline unless otherwise specified.`,
 	var fullRefresh []string
 
 	pipelineGroup := cmdgroup.NewFlagGroup("Pipeline Run")
-	pipelineGroup.FlagSet().StringSliceVar(&refresh, "refresh", nil, "List of tables to run.")
+	pipelineGroup.FlagSet().StringSliceVar(&refresh, "refresh", nil, "List of tables or source files to run. Local paths are relative to the current directory.")
 	pipelineGroup.FlagSet().BoolVar(&fullRefreshAll, "full-refresh-all", false, "Perform a full graph reset and recompute.")
-	pipelineGroup.FlagSet().StringSliceVar(&fullRefresh, "full-refresh", nil, "List of tables to reset and recompute.")
+	pipelineGroup.FlagSet().StringSliceVar(&fullRefresh, "full-refresh", nil, "List of tables or source files to reset and recompute. Local paths are relative to the current directory.")
 
 	wrappedCmd := cmdgroup.NewCommandWithGroupFlag(cmd)
 	wrappedCmd.AddFlagGroup(pipelineGroup)
@@ -285,6 +291,17 @@ Refreshes all tables in the pipeline unless otherwise specified.`,
 				FullRefresh:    fullRefresh,
 			},
 			NoWait: noWait,
+		}
+		if err := runOptions.Pipeline.Validate(nil); err != nil {
+			return err
+		}
+		runOptions.Pipeline.Refresh, runOptions.Pipeline.RefreshByPath, err = resolveRefreshSelectors(ctx, b, refresh)
+		if err != nil {
+			return fmt.Errorf("invalid --refresh: %w", err)
+		}
+		runOptions.Pipeline.FullRefresh, runOptions.Pipeline.FullRefreshByPath, err = resolveRefreshSelectors(ctx, b, fullRefresh)
+		if err != nil {
+			return fmt.Errorf("invalid --full-refresh: %w", err)
 		}
 
 		var runOutput bundlerunoutput.RunOutput

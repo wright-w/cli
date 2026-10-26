@@ -17,11 +17,15 @@ type PipelineOptions struct {
 	// List of tables to update.
 	Refresh []string
 
+	RefreshByPath []string
+
 	// Perform a full graph reset and recompute.
 	FullRefreshAll bool
 
 	// List of tables to reset and recompute.
 	FullRefresh []string
+
+	FullRefreshByPath []string
 
 	// Perform an update to validate graph correctness.
 	ValidateOnly bool
@@ -51,7 +55,7 @@ func (o *PipelineOptions) Validate(pipeline *resources.Pipeline) error {
 
 	if len(mutuallyExclusiveFlags) > 1 {
 		return fmt.Errorf("%s pipeline run flags are mutually exclusive", strings.Join(mutuallyExclusiveFlags, ", "))
-	} else if len(mutuallyExclusiveFlags) == 1 && (len(o.Refresh) > 0 || len(o.FullRefresh) > 0) {
+	} else if len(mutuallyExclusiveFlags) == 1 && (len(o.Refresh) > 0 || len(o.FullRefresh) > 0 || len(o.RefreshByPath) > 0 || len(o.FullRefreshByPath) > 0) {
 		return fmt.Errorf("cannot use --refresh or --full-refresh together with %s, these flags are mutually exclusive", strings.Join(mutuallyExclusiveFlags, ""))
 	}
 
@@ -66,10 +70,12 @@ func (o *PipelineOptions) toPayload(pipeline *resources.Pipeline, pipelineID str
 		PipelineId: pipelineID,
 
 		// Note: `RefreshAll` is implied if the fields below are not set.
-		RefreshSelection:     o.Refresh,
-		FullRefresh:          o.FullRefreshAll,
-		FullRefreshSelection: o.FullRefresh,
-		ValidateOnly:         o.ValidateOnly,
+		RefreshSelection:           o.Refresh,
+		FullRefresh:                o.FullRefreshAll,
+		FullRefreshSelection:       o.FullRefresh,
+		RefreshSelectionByPath:     o.RefreshByPath,
+		FullRefreshSelectionByPath: o.FullRefreshByPath,
+		ValidateOnly:               o.ValidateOnly,
 
 		// Only true is sent. When false the field is omitted, so the backend keeps
 		// using the pipeline-level development property while it is being deprecated.

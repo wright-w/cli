@@ -16,3 +16,22 @@ trace print_requests.py //pipelines
 title "Running pipeline with --full-refresh flag and --refresh flag"
 trace $CLI pipelines run --full-refresh table1,table2 --refresh table3,table4
 trace print_requests.py //pipelines
+
+title "Running pipeline with a file selector"
+trace $CLI pipelines run --refresh pipeline_file.py --no-wait
+trace print_requests.py //pipelines
+
+title "Running pipeline with a full-refresh notebook selector"
+trace $CLI pipelines run --full-refresh notebook.py --no-wait
+trace print_requests.py //pipelines
+
+title "Running pipeline with mixed table and source selectors"
+trace $CLI pipelines run --refresh table1,pipeline_file.py --full-refresh table2,notebook.py --no-wait
+trace print_requests.py //pipelines
+
+title "Rejecting missing and excluded sources"
+trace musterr $CLI pipelines run --refresh ./missing.sql --no-wait
+trace musterr $CLI pipelines run --refresh ./excluded.sql --no-wait
+trace musterr $CLI pipelines run --refresh pipeline_file.py --full-refresh-all --no-wait
+trace musterr $CLI pipelines run --full-refresh ./missing.sql --restart --no-wait
+trace test ! -e "$OUT_REQUESTS"
