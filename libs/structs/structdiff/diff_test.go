@@ -1052,13 +1052,13 @@ type pathsOuter struct {
 // changes recorded after the walk has left a subtree and entered a sibling.
 func TestGetStructDiffPathsSharingPrefix(t *testing.T) {
 	before := pathsOuter{
-		A:     pathsInner{X: "1", Y: "1", M: map[string]string{"k1": "1", "k-2": "1"}},
+		A:     pathsInner{X: "1", Y: "1", M: map[string]string{"k1": "1", "k-2": "1", "gone": "1", "same": "1"}},
 		B:     pathsInner{X: "1"},
 		L:     []pathsInner{{X: "1"}, {Y: "1"}},
 		Tasks: []jobs.Task{{TaskKey: "t1", Description: "1"}, {TaskKey: "t2", Description: "1"}},
 	}
 	after := pathsOuter{
-		A:     pathsInner{X: "2", Y: "2", M: map[string]string{"k1": "2", "k-2": "2"}},
+		A:     pathsInner{X: "2", Y: "2", M: map[string]string{"k1": "2", "k-2": "2", "added": "2", "same": "1"}},
 		B:     pathsInner{Y: "2"},
 		L:     []pathsInner{{X: "2"}, {Y: "2"}},
 		Tasks: []jobs.Task{{TaskKey: "t2", Description: "2"}, {TaskKey: "t3"}},
@@ -1076,6 +1076,8 @@ func TestGetStructDiffPathsSharingPrefix(t *testing.T) {
 	assert.Equal(t, []string{
 		"a.x",
 		"a.y",
+		"a.m['added']",
+		"a.m['gone']",
 		"a.m['k-2']",
 		"a.m['k1']",
 		"b.x",
@@ -1086,6 +1088,9 @@ func TestGetStructDiffPathsSharingPrefix(t *testing.T) {
 		"tasks[task_key='t2'].description",
 		"tasks[task_key='t3']",
 	}, paths)
+
+	assert.Equal(t, Change{Path: changes[2].Path, Old: nil, New: "2"}, changes[2])
+	assert.Equal(t, Change{Path: changes[3].Path, Old: "1", New: nil}, changes[3])
 
 	// Changes under one prefix share its nodes; this is what keeps the diff from
 	// allocating a path per visited field.

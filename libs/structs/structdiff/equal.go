@@ -1,6 +1,7 @@
 package structdiff
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 )
@@ -128,6 +129,12 @@ func equalStruct(s1, s2 reflect.Value) bool {
 }
 
 func equalMapStringKey(m1, m2 reflect.Value) bool {
+	// map[string]string is the common case; reflect would copy every key and value to the heap.
+	if s1, ok := reflect.TypeAssert[map[string]string](m1); ok {
+		s2, _ := reflect.TypeAssert[map[string]string](m2)
+		return maps.Equal(s1, s2)
+	}
+
 	keySet := map[string]reflect.Value{}
 	for _, k := range m1.MapKeys() {
 		// Key is always string at this point

@@ -68,6 +68,20 @@ type diffContext struct {
 	// allocated when a change is recorded there, since most visited values are equal.
 	path    []pathSegment
 	changes []Change
+
+	// mapKeys is a scratch buffer for diffStringMaps.
+	mapKeys []string
+}
+
+// Contexts are reused so the path stack and key buffer are not reallocated on every diff.
+var diffContextPool = sync.Pool{New: func() any { return &diffContext{} }}
+
+func (ctx *diffContext) release() {
+	// Drop references to the caller's values so the pool does not retain them.
+	clear(ctx.path[:cap(ctx.path)])
+	clear(ctx.mapKeys[:cap(ctx.mapKeys)])
+	*ctx = diffContext{path: ctx.path[:0], mapKeys: ctx.mapKeys[:0]}
+	diffContextPool.Put(ctx)
 }
 
 type segmentKind int
@@ -162,7 +176,9 @@ func GetStructDiff(a, b any, sliceKeys map[string]KeyFunc) ([]Change, error) {
 		return nil, fmt.Errorf("type mismatch: %v vs %v", v1.Type(), v2.Type())
 	}
 
-	ctx := &diffContext{sliceKeys: sliceKeys}
+	ctx := diffContextPool.Get().(*diffContext)
+	defer ctx.release()
+	ctx.sliceKeys = sliceKeys
 	if err := diffValues(ctx, v1, v2); err != nil {
 		return nil, err
 	}
@@ -335,6 +351,12 @@ func diffStruct(ctx *diffContext, s1, s2 reflect.Value) error {
 }
 
 func diffMapStringKey(ctx *diffContext, m1, m2 reflect.Value) error {
+	if s1, ok := reflect.TypeAssert[map[string]string](m1); ok {
+		s2, _ := reflect.TypeAssert[map[string]string](m2)
+		diffStringMaps(ctx, s1, s2)
+		return nil
+	}
+
 	keySet := map[string]reflect.Value{}
 	for _, k := range m1.MapKeys() {
 		// Caller guarantees the key kind is String; use Value.String() rather
@@ -360,6 +382,41 @@ func diffMapStringKey(ctx *diffContext, m1, m2 reflect.Value) error {
 		}
 	}
 	return nil
+}
+
+// diffStringMaps is diffMapStringKey for map[string]string, the most common map
+// type in configs (tags, spark_conf, ...). Going through reflect would copy every
+// key and value to the heap.
+func diffStringMaps(ctx *diffContext, m1, m2 map[string]string) {
+	keys := ctx.mapKeys[:0]
+	for k := range m1 {
+		keys = append(keys, k)
+	}
+	for k := range m2 {
+		if _, ok := m1[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	ctx.mapKeys = keys
+
+	for _, k := range keys {
+		s1, ok1 := m1[k]
+		s2, ok2 := m2[k]
+		if ok1 && ok2 && s1 == s2 {
+			continue
+		}
+		ctx.push(pathSegment{kind: segmentBracketString, key: k})
+		switch {
+		case !ok1:
+			ctx.addChange(nil, s2)
+		case !ok2:
+			ctx.addChange(s1, nil)
+		default:
+			ctx.addChange(s1, s2)
+		}
+		ctx.pop()
+	}
 }
 
 // structField is the per-type part of diffing a struct field, cached in structInfo.
