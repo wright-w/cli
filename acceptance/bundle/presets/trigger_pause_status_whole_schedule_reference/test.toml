@@ -1,1 +1,1 @@
-Badness = "trigger_pause_status fails with a confusing error when the schedule is a reference to the whole schedule of another job."
+Badness = "Required-field warnings are reported for a schedule that is a reference to a complete schedule."
