@@ -101,20 +101,27 @@ func (ctx *diffContext) pop() {
 // pathNode materializes the current path, reusing nodes already built for
 // earlier changes under the same prefix.
 func (ctx *diffContext) pathNode() *structpath.PathNode {
+	// Cached nodes always form a prefix of the stack, so only the segments after
+	// the last cached one need building.
+	start := len(ctx.path)
+	for start > 0 && ctx.path[start-1].node == nil {
+		start--
+	}
 	var prev *structpath.PathNode
-	for i := range ctx.path {
+	if start > 0 {
+		prev = ctx.path[start-1].node
+	}
+	for i := start; i < len(ctx.path); i++ {
 		s := &ctx.path[i]
-		if s.node == nil {
-			switch s.kind {
-			case segmentIndex:
-				s.node = structpath.NewIndex(prev, s.index)
-			case segmentDotString:
-				s.node = structpath.NewDotString(prev, s.key)
-			case segmentBracketString:
-				s.node = structpath.NewBracketString(prev, s.key)
-			case segmentKeyValue:
-				s.node = structpath.NewKeyValue(prev, s.key, s.value)
-			}
+		switch s.kind {
+		case segmentIndex:
+			s.node = structpath.NewIndex(prev, s.index)
+		case segmentDotString:
+			s.node = structpath.NewDotString(prev, s.key)
+		case segmentBracketString:
+			s.node = structpath.NewBracketString(prev, s.key)
+		case segmentKeyValue:
+			s.node = structpath.NewKeyValue(prev, s.key, s.value)
 		}
 		prev = s.node
 	}
