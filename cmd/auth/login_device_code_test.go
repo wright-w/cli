@@ -219,8 +219,10 @@ func startDeviceCodeLogin(t *testing.T, config string, args ...string) *termtest
 	t.Setenv(deviceCodeEnvVar, "true")
 
 	return termtest.Run(t, func(ctx context.Context) (struct{}, error) {
-		cmd := newLoginCommand(&auth.AuthArguments{})
+		authArguments := &auth.AuthArguments{}
+		cmd := newLoginCommand(authArguments)
 		cmd.Flags().String("profile", "", "")
+		cmd.Flags().StringVar(&authArguments.Host, "host", "", "")
 		cmd.SetContext(ctx)
 		cmd.SetArgs(append([]string{"--use-device-code"}, args...))
 		cmd.SetOut(io.Discard)
@@ -255,6 +257,16 @@ func TestLoginDeviceCodePickerEmptyHost(t *testing.T) {
 	tm.Type(termtest.KeyCtrlC)
 	_, err := tm.Result()
 	assert.EqualError(t, err, "^C")
+}
+
+func TestLoginDeviceCodeHostEmptyAfterNormalization(t *testing.T) {
+	for _, host := range []string{"/", "?o=123"} {
+		t.Run(host, func(t *testing.T) {
+			tm := startDeviceCodeLogin(t, "", "--profile", "newprof", "--host", host)
+			_, err := tm.Result()
+			assert.ErrorIs(t, err, errHostRequired)
+		})
+	}
 }
 
 func TestMatchDeviceCodeProfiles(t *testing.T) {
