@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/databricks/cli/libs/structs/structaccess"
 	"github.com/databricks/cli/libs/structs/structpath"
@@ -59,9 +60,69 @@ func (c *keyFuncCaller) call(elem any) (string, string) {
 	return keyField, keyValue
 }
 
-// diffContext holds configuration for the diff operation.
+// diffContext holds configuration and state for the diff operation.
 type diffContext struct {
 	sliceKeys map[string]KeyFunc
+
+	// path is the current position as a stack of segments. A PathNode is only
+	// allocated when a change is recorded there, since most visited values are equal.
+	path    []pathSegment
+	changes []Change
+}
+
+type segmentKind int
+
+const (
+	segmentIndex segmentKind = iota
+	segmentDotString
+	segmentBracketString
+	segmentKeyValue
+)
+
+type pathSegment struct {
+	kind  segmentKind
+	index int
+	key   string
+	value string
+
+	// node caches the materialized PathNode. It stays valid while the segment is
+	// on the stack, because the segments below it cannot change until it is popped.
+	node *structpath.PathNode
+}
+
+func (ctx *diffContext) push(s pathSegment) {
+	ctx.path = append(ctx.path, s)
+}
+
+func (ctx *diffContext) pop() {
+	ctx.path = ctx.path[:len(ctx.path)-1]
+}
+
+// pathNode materializes the current path, reusing nodes already built for
+// earlier changes under the same prefix.
+func (ctx *diffContext) pathNode() *structpath.PathNode {
+	var prev *structpath.PathNode
+	for i := range ctx.path {
+		s := &ctx.path[i]
+		if s.node == nil {
+			switch s.kind {
+			case segmentIndex:
+				s.node = structpath.NewIndex(prev, s.index)
+			case segmentDotString:
+				s.node = structpath.NewDotString(prev, s.key)
+			case segmentBracketString:
+				s.node = structpath.NewBracketString(prev, s.key)
+			case segmentKeyValue:
+				s.node = structpath.NewKeyValue(prev, s.key, s.value)
+			}
+		}
+		prev = s.node
+	}
+	return prev
+}
+
+func (ctx *diffContext) addChange(oldValue, newValue any) {
+	ctx.changes = append(ctx.changes, Change{Path: ctx.pathNode(), Old: oldValue, New: newValue})
 }
 
 // GetStructDiff compares two Go structs and returns a list of Changes or an error.
@@ -95,15 +156,14 @@ func GetStructDiff(a, b any, sliceKeys map[string]KeyFunc) ([]Change, error) {
 	}
 
 	ctx := &diffContext{sliceKeys: sliceKeys}
-	if err := diffValues(ctx, nil, v1, v2, &changes); err != nil {
+	if err := diffValues(ctx, v1, v2); err != nil {
 		return nil, err
 	}
-	return changes, nil
+	return ctx.changes, nil
 }
 
-// diffValues appends changes between v1 and v2 to the slice.  path is the current
-// JSON-style path (dot + brackets).  At the root path is "".
-func diffValues(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Value, changes *[]Change) error {
+// diffValues appends changes between v1 and v2 to ctx.changes, at the current ctx.path.
+func diffValues(ctx *diffContext, v1, v2 reflect.Value) error {
 	if !v1.IsValid() {
 		if !v2.IsValid() {
 			return nil
@@ -113,14 +173,14 @@ func diffValues(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Valu
 		for v2.Kind() == reflect.Pointer && !v2.IsNil() {
 			v2 = v2.Elem()
 		}
-		*changes = append(*changes, Change{Path: path, Old: nil, New: v2.Interface()})
+		ctx.addChange(nil, v2.Interface())
 		return nil
 	} else if !v2.IsValid() {
 		// v1 is valid
 		for v1.Kind() == reflect.Pointer && !v1.IsNil() {
 			v1 = v1.Elem()
 		}
-		*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: nil})
+		ctx.addChange(v1.Interface(), nil)
 		return nil
 	}
 
@@ -128,18 +188,7 @@ func diffValues(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Valu
 
 	// This should not happen; if it does, record this a full change
 	if v1Type != v2.Type() {
-		*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: v2.Interface()})
-		return nil
-	}
-
-	if IsOpaqueStruct(v1Type) {
-		equal, err := equalJSON(v1, v2)
-		if err != nil {
-			return err
-		}
-		if !equal {
-			*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: v2.Interface()})
-		}
+		ctx.addChange(v1.Interface(), v2.Interface())
 		return nil
 	}
 
@@ -154,7 +203,7 @@ func diffValues(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Valu
 			return nil
 		}
 		if v1Nil || v2Nil {
-			*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: v2.Interface()})
+			ctx.addChange(v1.Interface(), v2.Interface())
 			return nil
 		}
 	default:
@@ -164,112 +213,121 @@ func diffValues(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Valu
 
 	switch kind {
 	case reflect.Pointer:
-		return diffValues(ctx, path, v1.Elem(), v2.Elem(), changes)
+		return diffValues(ctx, v1.Elem(), v2.Elem())
 	case reflect.Struct:
-		return diffStruct(ctx, path, v1, v2, changes)
+		if IsOpaqueStruct(v1Type) {
+			equal, err := equalJSON(v1, v2)
+			if err != nil {
+				return err
+			}
+			if !equal {
+				ctx.addChange(v1.Interface(), v2.Interface())
+			}
+			return nil
+		}
+		return diffStruct(ctx, v1, v2)
 	case reflect.Slice, reflect.Array:
-		if keyFunc := ctx.findKeyFunc(path); keyFunc != nil {
-			return diffSliceByKey(ctx, path, v1, v2, keyFunc, changes)
+		if keyFunc := ctx.findKeyFunc(); keyFunc != nil {
+			return diffSliceByKey(ctx, v1, v2, keyFunc)
 		} else if v1.Len() != v2.Len() {
-			*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: v2.Interface()})
+			ctx.addChange(v1.Interface(), v2.Interface())
 		} else {
 			for i := range v1.Len() {
-				node := structpath.NewIndex(path, i)
-				if err := diffValues(ctx, node, v1.Index(i), v2.Index(i), changes); err != nil {
+				ctx.push(pathSegment{kind: segmentIndex, index: i})
+				err := diffValues(ctx, v1.Index(i), v2.Index(i))
+				ctx.pop()
+				if err != nil {
 					return err
 				}
 			}
 		}
 	case reflect.Map:
 		if v1Type.Key().Kind() == reflect.String {
-			return diffMapStringKey(ctx, path, v1, v2, changes)
+			return diffMapStringKey(ctx, v1, v2)
 		} else {
-			deepEqualValues(path, v1, v2, changes)
+			diffLeaf(ctx, v1, v2)
 		}
 	default:
-		deepEqualValues(path, v1, v2, changes)
+		diffLeaf(ctx, v1, v2)
 	}
 	return nil
 }
 
-func deepEqualValues(path *structpath.PathNode, v1, v2 reflect.Value, changes *[]Change) {
-	if !reflect.DeepEqual(v1.Interface(), v2.Interface()) {
-		*changes = append(*changes, Change{Path: path, Old: v1.Interface(), New: v2.Interface()})
+func diffLeaf(ctx *diffContext, v1, v2 reflect.Value) {
+	if !equalLeaf(v1, v2) {
+		ctx.addChange(v1.Interface(), v2.Interface())
 	}
 }
 
-func diffStruct(ctx *diffContext, path *structpath.PathNode, s1, s2 reflect.Value, changes *[]Change) error {
-	t := s1.Type()
-	forced1 := getForceSendFields(s1)
-	forced2 := getForceSendFields(s2)
+// equalLeaf compares values that are not walked into. Basic kinds are compared
+// directly: reflect.DeepEqual needs Interface(), which allocates for each of them.
+func equalLeaf(v1, v2 reflect.Value) bool {
+	switch v1.Kind() {
+	case reflect.String:
+		return v1.String() == v2.String()
+	case reflect.Bool:
+		return v1.Bool() == v2.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v1.Int() == v2.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v1.Uint() == v2.Uint()
+	case reflect.Float32, reflect.Float64:
+		return v1.Float() == v2.Float()
+	default:
+		return reflect.DeepEqual(v1.Interface(), v2.Interface())
+	}
+}
 
-	for i := range t.NumField() {
-		sf := t.Field(i)
-		if !sf.IsExported() || sf.Name == "ForceSendFields" {
-			continue
-		}
+func diffStruct(ctx *diffContext, s1, s2 reflect.Value) error {
+	info := getStructInfo(s1.Type())
+	forced1 := info.getForceSendFields(s1)
+	forced2 := info.getForceSendFields(s2)
 
-		// Continue traversing embedded structs. Do not add the key to the path though. An
-		// anonymous field carrying a json name is not one of these: encoding/json serializes it
-		// as a nested object, so it is handled as a named field below.
-		if structaccess.IsFlattenedEmbed(sf) {
-			if err := diffValues(ctx, path, s1.Field(i), s2.Field(i), changes); err != nil {
+	for _, f := range info.fields {
+		v1Field := s1.Field(f.index)
+		v2Field := s2.Field(f.index)
+
+		// Continue traversing embedded structs. Do not add the key to the path though.
+		if f.flattened {
+			if err := diffValues(ctx, v1Field, v2Field); err != nil {
 				return err
 			}
 			continue
 		}
 
-		jsonTag := structtag.JSONTag(sf.Tag.Get("json"))
-
-		// Resolve field name from JSON tag or fall back to Go field name
-		fieldName := jsonTag.Name()
-		if fieldName == "-" {
+		// `json:"-,"` names the field "-" for encoding/json, but the diff has always skipped it.
+		if f.dashName {
 			continue
 		}
 
-		isEmbed := sf.Name == structaccess.EmbeddedSliceFieldName
-
-		if fieldName == "" || isEmbed {
-			fieldName = sf.Name
-		}
-
-		v1Field := s1.Field(i)
-		v2Field := s2.Field(i)
-
-		zero1 := v1Field.IsZero()
-		zero2 := v2Field.IsZero()
-
-		if zero1 || zero2 {
-			if jsonTag.OmitEmpty() {
-				if zero1 {
-					if !slices.Contains(forced1, sf.Name) {
-						v1Field = reflect.ValueOf(nil)
-					}
-				}
-				if zero2 {
-					if !slices.Contains(forced2, sf.Name) {
-						v2Field = reflect.ValueOf(nil)
-					}
-				}
+		if f.omitEmpty {
+			if v1Field.IsZero() && !slices.Contains(forced1, f.goName) {
+				v1Field = reflect.ValueOf(nil)
+			}
+			if v2Field.IsZero() && !slices.Contains(forced2, f.goName) {
+				v2Field = reflect.ValueOf(nil)
 			}
 		}
 
 		// EmbeddedSlice: diff at parent path level without adding field name.
-		var node *structpath.PathNode
-		if isEmbed {
-			node = path
-		} else {
-			node = structpath.NewDotString(path, fieldName)
+		if f.embeddedSlice {
+			if err := diffValues(ctx, v1Field, v2Field); err != nil {
+				return err
+			}
+			continue
 		}
 
-		if err := diffValues(ctx, node, v1Field, v2Field, changes); err != nil {
+		ctx.push(pathSegment{kind: segmentDotString, key: f.name})
+		err := diffValues(ctx, v1Field, v2Field)
+		ctx.pop()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func diffMapStringKey(ctx *diffContext, path *structpath.PathNode, m1, m2 reflect.Value, changes *[]Change) error {
+func diffMapStringKey(ctx *diffContext, m1, m2 reflect.Value) error {
 	keySet := map[string]reflect.Value{}
 	for _, k := range m1.MapKeys() {
 		// Caller guarantees the key kind is String; use Value.String() rather
@@ -287,59 +345,132 @@ func diffMapStringKey(ctx *diffContext, path *structpath.PathNode, m1, m2 reflec
 		k := keySet[ks]
 		v1 := m1.MapIndex(k)
 		v2 := m2.MapIndex(k)
-		node := structpath.NewBracketString(path, ks)
-		if err := diffValues(ctx, node, v1, v2, changes); err != nil {
+		ctx.push(pathSegment{kind: segmentBracketString, key: ks})
+		err := diffValues(ctx, v1, v2)
+		ctx.pop()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func getForceSendFields(v reflect.Value) []string {
-	if !v.IsValid() || v.Kind() != reflect.Struct {
-		return nil
-	}
-	fsField := v.FieldByName("ForceSendFields")
-	if !fsField.IsValid() || fsField.Kind() != reflect.Slice {
-		return nil
-	}
-	result, ok := reflect.TypeAssert[[]string](fsField)
-	if ok {
-		return result
-	}
-	return nil
+// structField is the per-type part of diffing a struct field, cached in structInfo.
+type structField struct {
+	index int
+	// name is the JSON key, or the Go field name when the tag has none.
+	name   string
+	goName string
+
+	omitEmpty bool
+	dashName  bool
+
+	// flattened marks an anonymous struct that encoding/json promotes into the parent.
+	// An anonymous field carrying a json name is not one of these: encoding/json
+	// serializes it as a nested object, so it is handled as a named field.
+	flattened bool
+
+	embeddedSlice bool
 }
 
-// findKeyFunc returns the KeyFunc for the given path, or nil if none matches.
+type structInfo struct {
+	// fields holds the exported fields to walk, in declaration order. ForceSendFields
+	// and fields tagged exactly `json:"-"` are left out.
+	fields []structField
+
+	// forceSendFieldsIndex locates ForceSendFields (possibly promoted from an
+	// embedded struct); nil if the struct has no []string field of that name.
+	forceSendFieldsIndex []int
+}
+
+// Keyed by reflect.Type; parsing struct tags for every visited field dominated the diff.
+var structInfoCache sync.Map
+
+func getStructInfo(t reflect.Type) *structInfo {
+	if cached, ok := structInfoCache.Load(t); ok {
+		return cached.(*structInfo)
+	}
+	info := newStructInfo(t)
+	structInfoCache.Store(t, info)
+	return info
+}
+
+func newStructInfo(t reflect.Type) *structInfo {
+	info := &structInfo{}
+
+	if sf, ok := t.FieldByName("ForceSendFields"); ok && sf.Type == reflect.TypeFor[[]string]() {
+		info.forceSendFieldsIndex = sf.Index
+	}
+
+	for i := range t.NumField() {
+		sf := t.Field(i)
+		if !sf.IsExported() || sf.Name == "ForceSendFields" {
+			continue
+		}
+
+		if structaccess.IsFlattenedEmbed(sf) {
+			info.fields = append(info.fields, structField{index: i, flattened: true})
+			continue
+		}
+
+		if structaccess.IsSkippedField(sf) {
+			continue
+		}
+
+		jsonTag := structtag.JSONTag(sf.Tag.Get("json"))
+
+		// Resolve field name from JSON tag or fall back to Go field name
+		fieldName := jsonTag.Name()
+
+		isEmbed := sf.Name == structaccess.EmbeddedSliceFieldName
+
+		if fieldName == "" || isEmbed {
+			fieldName = sf.Name
+		}
+
+		info.fields = append(info.fields, structField{
+			index:         i,
+			name:          fieldName,
+			goName:        sf.Name,
+			omitEmpty:     jsonTag.OmitEmpty(),
+			dashName:      jsonTag.Name() == "-",
+			embeddedSlice: isEmbed,
+		})
+	}
+	return info
+}
+
+func (info *structInfo) getForceSendFields(v reflect.Value) []string {
+	if info.forceSendFieldsIndex == nil {
+		return nil
+	}
+	result, _ := reflect.TypeAssert[[]string](v.FieldByIndex(info.forceSendFieldsIndex))
+	return result
+}
+
+// findKeyFunc returns the KeyFunc for the current path, or nil if none matches.
 // Path patterns support [*] to match any slice index.
-func (ctx *diffContext) findKeyFunc(path *structpath.PathNode) KeyFunc {
+func (ctx *diffContext) findKeyFunc() KeyFunc {
 	if ctx.sliceKeys == nil {
 		return nil
 	}
-	pathStr := pathToPattern(path)
-	return ctx.sliceKeys[pathStr]
+	return ctx.sliceKeys[ctx.pathPattern()]
 }
 
-// pathToPattern converts a PathNode to a pattern string for matching.
+// pathPattern converts the current path to a pattern string for matching.
 // Slice indices and key-value pairs are converted to [*] wildcard.
-func pathToPattern(path *structpath.PathNode) string {
-	if path == nil {
-		return ""
-	}
-
-	components := path.AsSlice()
+func (ctx *diffContext) pathPattern() string {
 	var result strings.Builder
 
-	for i, node := range components {
-		if _, ok := node.Index(); ok {
+	for i, s := range ctx.path {
+		switch s.kind {
+		case segmentIndex, segmentKeyValue:
 			result.WriteString("[*]")
-		} else if _, _, ok := node.KeyValue(); ok {
-			result.WriteString("[*]")
-		} else if key, ok := node.StringKey(); ok {
+		case segmentDotString, segmentBracketString:
 			if i != 0 {
 				result.WriteString(".")
 			}
-			result.WriteString(key)
+			result.WriteString(s.key)
 		}
 	}
 
@@ -369,7 +500,7 @@ func validateKeyFuncElementType(seq reflect.Value, expected reflect.Type) error 
 // diffSliceByKey compares two slices using the provided key function.
 // Elements are matched by their (keyField, keyValue) pairs instead of by index.
 // Duplicate keys are allowed and matched in order.
-func diffSliceByKey(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.Value, keyFunc KeyFunc, changes *[]Change) error {
+func diffSliceByKey(ctx *diffContext, v1, v2 reflect.Value, keyFunc KeyFunc) error {
 	caller, err := newKeyFuncCaller(keyFunc)
 	if err != nil {
 		return err
@@ -423,26 +554,34 @@ func diffSliceByKey(ctx *diffContext, path *structpath.PathNode, v1, v2 reflect.
 			keyField = list2[0].keyField
 		}
 
-		// Match elements in order
-		minLen := min(len(list1), len(list2))
-		for i := range minLen {
-			node := structpath.NewKeyValue(path, keyField, keyValue)
-			if err := diffValues(ctx, node, list1[i].value, list2[i].value, changes); err != nil {
-				return err
-			}
+		ctx.push(pathSegment{kind: segmentKeyValue, key: keyField, value: keyValue})
+		err := diffKeyGroup(ctx, list1, list2)
+		ctx.pop()
+		if err != nil {
+			return err
 		}
+	}
+	return nil
+}
 
-		// Handle extra elements in old (deleted)
-		for i := minLen; i < len(list1); i++ {
-			node := structpath.NewKeyValue(path, keyField, keyValue)
-			*changes = append(*changes, Change{Path: node, Old: list1[i].value.Interface(), New: nil})
+// diffKeyGroup diffs the elements of both slices that share one key, at the current path.
+func diffKeyGroup(ctx *diffContext, list1, list2 []sliceElement) error {
+	// Match elements in order
+	minLen := min(len(list1), len(list2))
+	for i := range minLen {
+		if err := diffValues(ctx, list1[i].value, list2[i].value); err != nil {
+			return err
 		}
+	}
 
-		// Handle extra elements in new (added)
-		for i := minLen; i < len(list2); i++ {
-			node := structpath.NewKeyValue(path, keyField, keyValue)
-			*changes = append(*changes, Change{Path: node, Old: nil, New: list2[i].value.Interface()})
-		}
+	// Handle extra elements in old (deleted)
+	for i := minLen; i < len(list1); i++ {
+		ctx.addChange(list1[i].value.Interface(), nil)
+	}
+
+	// Handle extra elements in new (added)
+	for i := minLen; i < len(list2); i++ {
+		ctx.addChange(nil, list2[i].value.Interface())
 	}
 	return nil
 }

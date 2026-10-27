@@ -1034,3 +1034,60 @@ func TestGetStructDiffWholeBlock(t *testing.T) {
 		})
 	}
 }
+
+type pathsInner struct {
+	X string            `json:"x"`
+	Y string            `json:"y"`
+	M map[string]string `json:"m"`
+}
+
+type pathsOuter struct {
+	A     pathsInner   `json:"a"`
+	B     pathsInner   `json:"b"`
+	L     []pathsInner `json:"l"`
+	Tasks []jobs.Task  `json:"tasks"`
+}
+
+// TestGetStructDiffPathsSharingPrefix covers changes whose paths share a prefix and
+// changes recorded after the walk has left a subtree and entered a sibling.
+func TestGetStructDiffPathsSharingPrefix(t *testing.T) {
+	before := pathsOuter{
+		A:     pathsInner{X: "1", Y: "1", M: map[string]string{"k1": "1", "k-2": "1"}},
+		B:     pathsInner{X: "1"},
+		L:     []pathsInner{{X: "1"}, {Y: "1"}},
+		Tasks: []jobs.Task{{TaskKey: "t1", Description: "1"}, {TaskKey: "t2", Description: "1"}},
+	}
+	after := pathsOuter{
+		A:     pathsInner{X: "2", Y: "2", M: map[string]string{"k1": "2", "k-2": "2"}},
+		B:     pathsInner{Y: "2"},
+		L:     []pathsInner{{X: "2"}, {Y: "2"}},
+		Tasks: []jobs.Task{{TaskKey: "t2", Description: "2"}, {TaskKey: "t3"}},
+	}
+
+	changes, err := GetStructDiff(before, after, map[string]KeyFunc{
+		"tasks": func(task jobs.Task) (string, string) { return "task_key", task.TaskKey },
+	})
+	require.NoError(t, err)
+
+	var paths []string
+	for _, ch := range changes {
+		paths = append(paths, ch.Path.String())
+	}
+	assert.Equal(t, []string{
+		"a.x",
+		"a.y",
+		"a.m['k-2']",
+		"a.m['k1']",
+		"b.x",
+		"b.y",
+		"l[0].x",
+		"l[1].y",
+		"tasks[task_key='t1']",
+		"tasks[task_key='t2'].description",
+		"tasks[task_key='t3']",
+	}, paths)
+
+	// Changes under one prefix share its nodes; this is what keeps the diff from
+	// allocating a path per visited field.
+	assert.Same(t, changes[0].Path.Parent(), changes[1].Path.Parent())
+}

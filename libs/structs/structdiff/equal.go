@@ -3,9 +3,6 @@ package structdiff
 import (
 	"reflect"
 	"slices"
-
-	"github.com/databricks/cli/libs/structs/structaccess"
-	"github.com/databricks/cli/libs/structs/structtag"
 )
 
 // IsEqual compares two Go structs and returns true if they are equal.
@@ -47,13 +44,6 @@ func equalValues(v1, v2 reflect.Value) bool {
 		return false
 	}
 
-	if IsOpaqueStruct(v1Type) {
-		// A marshaling failure is reported as "not equal" so the change surfaces
-		// rather than being silently dropped.
-		equal, err := equalJSON(v1, v2)
-		return err == nil && equal
-	}
-
 	kind := v1.Kind()
 
 	// Perform nil checks for nilable types.
@@ -76,6 +66,12 @@ func equalValues(v1, v2 reflect.Value) bool {
 	case reflect.Pointer:
 		return equalValues(v1.Elem(), v2.Elem())
 	case reflect.Struct:
+		if IsOpaqueStruct(v1Type) {
+			// A marshaling failure is reported as "not equal" so the change surfaces
+			// rather than being silently dropped.
+			equal, err := equalJSON(v1, v2)
+			return err == nil && equal
+		}
 		return equalStruct(v1, v2)
 	case reflect.Slice, reflect.Array:
 		if v1.Len() != v2.Len() {
@@ -92,56 +88,35 @@ func equalValues(v1, v2 reflect.Value) bool {
 		}
 		return reflect.DeepEqual(v1.Interface(), v2.Interface())
 	default:
-		return reflect.DeepEqual(v1.Interface(), v2.Interface())
+		return equalLeaf(v1, v2)
 	}
 	return true
 }
 
 func equalStruct(s1, s2 reflect.Value) bool {
-	t := s1.Type()
-	forced1 := getForceSendFields(s1)
-	forced2 := getForceSendFields(s2)
+	info := getStructInfo(s1.Type())
+	forced1 := info.getForceSendFields(s1)
+	forced2 := info.getForceSendFields(s2)
 
-	for i := range t.NumField() {
-		sf := t.Field(i)
-		if !sf.IsExported() || sf.Name == "ForceSendFields" {
-			continue
-		}
+	for _, f := range info.fields {
+		v1Field := s1.Field(f.index)
+		v2Field := s2.Field(f.index)
 
 		// Continue traversing embedded structs. A tagged anonymous field is a named field to
 		// encoding/json, so it goes through the path below.
-		if structaccess.IsFlattenedEmbed(sf) {
-			if !equalValues(s1.Field(i), s2.Field(i)) {
+		if f.flattened {
+			if !equalValues(v1Field, v2Field) {
 				return false
 			}
 			continue
 		}
 
-		jsonTag := structtag.JSONTag(sf.Tag.Get("json"))
-
-		// Skip fields with json:"-"
-		if structaccess.IsSkippedField(sf) {
-			continue
-		}
-
-		v1Field := s1.Field(i)
-		v2Field := s2.Field(i)
-
-		zero1 := v1Field.IsZero()
-		zero2 := v2Field.IsZero()
-
-		if zero1 || zero2 {
-			if jsonTag.OmitEmpty() {
-				if zero1 {
-					if !slices.Contains(forced1, sf.Name) {
-						v1Field = reflect.ValueOf(nil)
-					}
-				}
-				if zero2 {
-					if !slices.Contains(forced2, sf.Name) {
-						v2Field = reflect.ValueOf(nil)
-					}
-				}
+		if f.omitEmpty {
+			if v1Field.IsZero() && !slices.Contains(forced1, f.goName) {
+				v1Field = reflect.ValueOf(nil)
+			}
+			if v2Field.IsZero() && !slices.Contains(forced2, f.goName) {
+				v2Field = reflect.ValueOf(nil)
 			}
 		}
 
